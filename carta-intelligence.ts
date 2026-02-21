@@ -514,4 +514,4 @@ console.log(`
 startScheduler();
 
 await app.listen({ port: PORT, host: '0.0.0.0' });
-console.log(`[carta] Listening on port ${PORT} — GraphQL at /graphql, health at /health`);
+console.log(`[carta] Listening on port ${PORT} — GraphQL POST /graphql | GraphiQL GET /graphiql | REST GET /health`);

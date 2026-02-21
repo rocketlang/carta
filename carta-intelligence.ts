@@ -1,19 +1,19 @@
 #!/usr/bin/env bun
 /**
- * Carta Intelligence Layer v1.0.0
+ * Carta Intelligence Layer v1.1.0
  * Maritime RSS + IMO monitor + daily brief generator
  *
- * Part of ANKR Labs AI-CMO infrastructure.
- * Polls 7 maritime RSS feeds + IMO.org every 30 min.
- * Generates a structured morning brief at 06:30 via Claude (through ai-proxy).
- * Archives briefs to /root/carta-briefs/ and indexes them in ankr-interact.
+ * API: GraphQL via Mercurius (POST /graphql, GraphiQL at GET /graphql)
+ *      REST GET /health retained for ankr-ctl health checks
  *
- * Run: bun /root/carta-intelligence.ts
+ * Run: bun carta-intelligence.ts
  * Port: 4055
  */
 
 import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync } from 'fs';
 import { join } from 'path';
+import Fastify from 'fastify';
+import mercurius from 'mercurius';
 
 // ─── Config ───────────────────────────────────────────────────────────────────
 
@@ -25,11 +25,11 @@ const STATE_FILE = '/root/carta-state.json';
 const BRIEFS_DIR = '/root/carta-briefs';
 const INTAKE_DIR = '/root/ankr-intake';
 
-const BRIEF_HOUR = 6;       // 06:30 local time daily
+const BRIEF_HOUR = 6;
 const BRIEF_MINUTE = 30;
-const POLL_INTERVAL_MS = 30 * 60 * 1000;  // 30 minutes
-const FETCH_TIMEOUT_MS = 8_000;            // 8s per source
-const LOOKBACK_HOURS = 48;                 // ignore items older than 48h
+const POLL_INTERVAL_MS = 30 * 60 * 1000;
+const FETCH_TIMEOUT_MS = 8_000;
+const LOOKBACK_HOURS = 48;
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -71,7 +71,6 @@ function loadState(): State {
 }
 
 function saveState(state: State): void {
-  // Cap seenIds to prevent unbounded growth
   if (state.seenIds.length > 5000) {
     state.seenIds = state.seenIds.slice(-3000);
   }
@@ -84,7 +83,6 @@ function extractXmlText(xml: string, tag: string): string {
   const cdataRe = new RegExp(`<${tag}[^>]*><!\\[CDATA\\[([\\s\\S]*?)\\]\\]><\\/${tag}>`, 'i');
   const cdataMatch = cdataRe.exec(xml);
   if (cdataMatch) return cdataMatch[1].trim();
-
   const plainRe = new RegExp(`<${tag}[^>]*>([\\s\\S]*?)<\\/${tag}>`, 'i');
   const plainMatch = plainRe.exec(xml);
   return plainMatch ? plainMatch[1].replace(/<[^>]+>/g, '').trim() : '';
@@ -98,9 +96,7 @@ function parseRssItems(xml: string): Array<{ title: string; link: string; pubDat
     const chunk = match[1];
     items.push({
       title: extractXmlText(chunk, 'title'),
-      link:
-        extractXmlText(chunk, 'link') ||
-        extractXmlText(chunk, 'guid'),
+      link: extractXmlText(chunk, 'link') || extractXmlText(chunk, 'guid'),
       pubDate:
         extractXmlText(chunk, 'pubDate') ||
         extractXmlText(chunk, 'dc:date') ||
@@ -120,11 +116,11 @@ async function fetchFeed(source: Source, seenIds: string[]): Promise<IntelItem[]
     const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
     const res = await fetch(source.url, {
       signal: controller.signal,
-      headers: { 'User-Agent': 'Carta-Intelligence/1.0 (ANKR Labs maritime AI; +https://ankr.in)' },
+      headers: { 'User-Agent': 'Carta-Intelligence/1.1 (ANKR Labs maritime AI; +https://ankr.in)' },
     });
     clearTimeout(timer);
-
     if (!res.ok) return [];
+
     const xml = await res.text();
     const rawItems = parseRssItems(xml);
     const cutoff = Date.now() - LOOKBACK_HOURS * 60 * 60 * 1000;
@@ -148,8 +144,7 @@ async function fetchFeed(source: Source, seenIds: string[]): Promise<IntelItem[]
     }
     return results;
   } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    console.error(`[carta] Feed failed (${source.name}): ${msg}`);
+    console.error(`[carta] Feed failed (${source.name}): ${err instanceof Error ? err.message : err}`);
     return [];
   }
 }
@@ -162,7 +157,7 @@ async function fetchImoCirculars(seenIds: string[]): Promise<IntelItem[]> {
     const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
     const res = await fetch('https://www.imo.org/en/MediaCentre/Pages/WhatsNew.aspx', {
       signal: controller.signal,
-      headers: { 'User-Agent': 'Carta-Intelligence/1.0 (ANKR Labs; +https://ankr.in)' },
+      headers: { 'User-Agent': 'Carta-Intelligence/1.1 (ANKR Labs; +https://ankr.in)' },
     });
     clearTimeout(timer);
     if (!res.ok) return [];
@@ -176,9 +171,7 @@ async function fetchImoCirculars(seenIds: string[]): Promise<IntelItem[]> {
       const href = match[1];
       const text = match[2].replace(/<[^>]+>/g, '').trim();
       if (!text || text.length < 10) continue;
-
-      const relevant = /MEPC|MSC|Circular|CII|EEXI|ETS|decarbonisation|carbon|emission/i.test(text + href);
-      if (!relevant) continue;
+      if (!/MEPC|MSC|Circular|CII|EEXI|ETS|decarbonisation|carbon|emission/i.test(text + href)) continue;
 
       const fullUrl = href.startsWith('http') ? href : `https://www.imo.org${href}`;
       const id = `IMO::${fullUrl}`;
@@ -196,7 +189,6 @@ async function fetchImoCirculars(seenIds: string[]): Promise<IntelItem[]> {
       });
     }
 
-    // Deduplicate by URL
     const seen = new Set<string>();
     return results.filter(item => {
       if (seen.has(item.link)) return false;
@@ -204,8 +196,7 @@ async function fetchImoCirculars(seenIds: string[]): Promise<IntelItem[]> {
       return true;
     });
   } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    console.error(`[carta] IMO fetch failed: ${msg}`);
+    console.error(`[carta] IMO fetch failed: ${err instanceof Error ? err.message : err}`);
     return [];
   }
 }
@@ -236,7 +227,6 @@ If no new items, write a brief noting quiet seas and suggest a proactive content
 
 async function generateBrief(items: IntelItem[], date: string): Promise<string> {
   const hasAlert = items.some(i => i.isAlert);
-
   const itemsText =
     items.length === 0
       ? 'No new intelligence items in the last 24 hours.'
@@ -247,11 +237,7 @@ async function generateBrief(items: IntelItem[], date: string): Promise<string> 
           )
           .join('\n\n---\n\n');
 
-  const userPrompt = `Generate the Carta Morning Brief for ${date}.
-
-New intelligence items (${items.length} total${hasAlert ? ', ⚠️ REGULATORY ALERT' : ''}):
-
-${itemsText}`;
+  const userPrompt = `Generate the Carta Morning Brief for ${date}.\n\nNew intelligence items (${items.length} total${hasAlert ? ', ⚠️ REGULATORY ALERT' : ''}):\n\n${itemsText}`;
 
   try {
     const res = await fetch(`${AI_PROXY_URL}/v1/chat/completions`, {
@@ -266,16 +252,12 @@ ${itemsText}`;
         max_tokens: 2000,
       }),
     });
-
-    if (!res.ok) {
-      throw new Error(`ai-proxy ${res.status}: ${await res.text()}`);
-    }
+    if (!res.ok) throw new Error(`ai-proxy ${res.status}: ${await res.text()}`);
     const data = (await res.json()) as { choices: Array<{ message: { content: string } }> };
     return data.choices[0]?.message?.content ?? '[empty response from ai-proxy]';
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     console.error(`[carta] Brief generation failed: ${msg}`);
-    // Fallback: plain item list
     return [
       `# Carta Morning Brief — ${date}`,
       '',
@@ -290,13 +272,11 @@ ${itemsText}`;
 // ─── Brief Publisher ──────────────────────────────────────────────────────────
 
 async function publishBrief(brief: string, date: string): Promise<void> {
-  // 1. Archive to carta-briefs/
   if (!existsSync(BRIEFS_DIR)) mkdirSync(BRIEFS_DIR, { recursive: true });
   const briefPath = join(BRIEFS_DIR, `carta-brief-${date}.md`);
   writeFileSync(briefPath, brief);
   console.log(`[carta] Brief archived → ${briefPath}`);
 
-  // 2. POST to ankr-interact /api/intake for RAG indexing
   try {
     const res = await fetch(INTAKE_URL, {
       method: 'POST',
@@ -315,8 +295,7 @@ async function publishBrief(brief: string, date: string): Promise<void> {
       dropToIntakeDir(brief, date);
     }
   } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    console.warn(`[carta] Intake POST error: ${msg} — falling back to file drop`);
+    console.warn(`[carta] Intake POST error: ${err instanceof Error ? err.message : err} — file drop fallback`);
     dropToIntakeDir(brief, date);
   }
 }
@@ -349,13 +328,10 @@ async function pollSources(): Promise<void> {
   console.log(`[carta] Polling ${sources.length} RSS feeds + IMO at ${new Date().toISOString()}`);
   const newItems: IntelItem[] = [];
 
-  // Fetch RSS feeds (sequential to be polite; fast enough at 30-min interval)
   for (const source of sources) {
     const items = await fetchFeed(source, state.seenIds);
     newItems.push(...items);
   }
-
-  // Fetch IMO circulars
   const imoItems = await fetchImoCirculars(state.seenIds);
   newItems.push(...imoItems);
 
@@ -363,8 +339,6 @@ async function pollSources(): Promise<void> {
     console.log(`[carta] ${newItems.length} new items found`);
     state.seenIds.push(...newItems.map(i => i.id));
     state.itemBuffer = [...(state.itemBuffer ?? []), ...newItems];
-
-    // Immediate alert for regulatory items found outside brief window
     const alerts = newItems.filter(i => i.isAlert);
     if (alerts.length > 0) {
       console.log(`[carta] ⚠️  REGULATORY ALERT: ${alerts.length} new IMO items`);
@@ -390,7 +364,7 @@ async function generateDailyBrief(): Promise<void> {
   await publishBrief(brief, today);
   lastBriefGenerated = today;
   state.lastBriefDate = today;
-  state.itemBuffer = [];   // Clear buffer after publishing
+  state.itemBuffer = [];
   saveState(state);
   console.log(`[carta] Daily brief complete (${items.length} items)`);
 }
@@ -398,18 +372,13 @@ async function generateDailyBrief(): Promise<void> {
 async function immediateAlert(alertItems: IntelItem[]): Promise<void> {
   const tag = `${todayStr()}-alert-${Date.now()}`;
   const brief = await generateBrief(alertItems, `${todayStr()} (Regulatory Alert)`);
-  const wrapped = `> ⚠️ **IMMEDIATE REGULATORY ALERT** — Generated outside regular brief window\n\n${brief}`;
-  await publishBrief(wrapped, tag);
+  await publishBrief(`> ⚠️ **IMMEDIATE REGULATORY ALERT**\n\n${brief}`, tag);
 }
 
 function startScheduler(): void {
-  // Immediate first poll
   pollSources().catch(console.error);
-
-  // Recurring 30-min poll
   setInterval(() => pollSources().catch(console.error), POLL_INTERVAL_MS);
 
-  // Schedule daily brief at 06:30
   function scheduleNextBrief(): void {
     const now = new Date();
     const next = new Date();
@@ -425,72 +394,109 @@ function startScheduler(): void {
   scheduleNextBrief();
 }
 
-// ─── HTTP Server ──────────────────────────────────────────────────────────────
+// ─── Helpers shared between REST and GraphQL resolvers ────────────────────────
 
 function listBriefs(): string[] {
   if (!existsSync(BRIEFS_DIR)) return [];
-  return readdirSync(BRIEFS_DIR)
-    .filter(f => f.endsWith('.md'))
-    .sort()
-    .reverse();
+  return readdirSync(BRIEFS_DIR).filter(f => f.endsWith('.md')).sort().reverse();
 }
 
-function getLatestBrief(): string | null {
-  const briefs = listBriefs();
-  if (!briefs.length) return null;
+function healthPayload() {
+  let sourcesLoaded = 0;
   try {
-    return readFileSync(join(BRIEFS_DIR, briefs[0]), 'utf-8');
-  } catch {
-    return null;
-  }
+    sourcesLoaded = (JSON.parse(readFileSync(SOURCES_FILE, 'utf-8')) as Source[]).length;
+  } catch {}
+  return {
+    status: 'ok',
+    version: '1.1.0',
+    lastBrief: lastBriefGenerated,
+    lastPollTime: state.lastPollTime,
+    sourcesLoaded,
+    itemsInBuffer: (state.itemBuffer ?? []).length,
+    seenIdsCount: state.seenIds.length,
+    briefsArchived: listBriefs().length,
+    uptime: Math.round(process.uptime()),
+  };
 }
 
-Bun.serve({
-  port: PORT,
-  async fetch(req) {
-    const { pathname } = new URL(req.url);
+// ─── GraphQL Schema ───────────────────────────────────────────────────────────
 
-    if (req.method === 'GET' && pathname === '/health') {
-      let sourcesCount = 0;
+const schema = `
+  type HealthStatus {
+    status: String!
+    version: String!
+    lastBrief: String
+    lastPollTime: String
+    sourcesLoaded: Int!
+    itemsInBuffer: Int!
+    seenIdsCount: Int!
+    briefsArchived: Int!
+    uptime: Int!
+  }
+
+  type Brief {
+    date: String!
+    filename: String!
+    content: String!
+  }
+
+  type GenerateResult {
+    status: String!
+    message: String!
+  }
+
+  type Query {
+    health: HealthStatus!
+    latestBrief: Brief
+    briefs: [String!]!
+  }
+
+  type Mutation {
+    generateBrief: GenerateResult!
+  }
+`;
+
+const resolvers = {
+  Query: {
+    health: () => healthPayload(),
+
+    latestBrief: () => {
+      const files = listBriefs();
+      if (!files.length) return null;
+      const filename = files[0];
       try {
-        sourcesCount = (JSON.parse(readFileSync(SOURCES_FILE, 'utf-8')) as Source[]).length;
-      } catch {}
-      return Response.json({
-        status: 'ok',
-        service: 'carta-intelligence',
-        version: '1.0.0',
-        lastBrief: lastBriefGenerated,
-        lastPollTime: state.lastPollTime,
-        sourcesLoaded: sourcesCount,
-        itemsInBuffer: (state.itemBuffer ?? []).length,
-        seenIdsCount: state.seenIds.length,
-        briefsArchived: listBriefs().length,
-        uptime: Math.round(process.uptime()),
-      });
-    }
+        const content = readFileSync(join(BRIEFS_DIR, filename), 'utf-8');
+        const date = filename.replace('carta-brief-', '').replace('.md', '');
+        return { date, filename, content };
+      } catch {
+        return null;
+      }
+    },
 
-    if (req.method === 'POST' && pathname === '/api/brief/generate') {
-      // Force regeneration even if already generated today
-      const today = todayStr();
-      lastBriefGenerated = null;   // reset guard
-      generateDailyBrief().catch(console.error);
-      lastBriefGenerated = today;
-      return Response.json({ status: 'generating', message: 'Brief generation triggered — check /api/brief/latest in ~30s' });
-    }
-
-    if (req.method === 'GET' && pathname === '/api/brief/latest') {
-      const brief = getLatestBrief();
-      if (!brief) return new Response('No briefs generated yet', { status: 404 });
-      return new Response(brief, { headers: { 'Content-Type': 'text/markdown; charset=utf-8' } });
-    }
-
-    if (req.method === 'GET' && pathname === '/api/brief/list') {
-      return Response.json({ briefs: listBriefs() });
-    }
-
-    return new Response('Not found', { status: 404 });
+    briefs: () => listBriefs(),
   },
+
+  Mutation: {
+    generateBrief: async () => {
+      lastBriefGenerated = null;   // reset guard so it runs even if already generated today
+      generateDailyBrief().catch(console.error);
+      return { status: 'generating', message: 'Brief generation triggered — query latestBrief in ~30s' };
+    },
+  },
+};
+
+// ─── Fastify + Mercurius Server ───────────────────────────────────────────────
+
+const app = Fastify({ logger: false });
+
+await app.register(mercurius, {
+  schema,
+  resolvers,
+  graphiql: true,   // GraphiQL UI at GET /graphql
 });
+
+// REST /health — retained for ankr-ctl health checks
+app.get('/health', async () => ({ service: 'carta-intelligence', ...healthPayload() }));
 
 // ─── Boot ─────────────────────────────────────────────────────────────────────
 
@@ -498,11 +504,14 @@ if (!existsSync(BRIEFS_DIR)) mkdirSync(BRIEFS_DIR, { recursive: true });
 
 console.log(`
 ╔══════════════════════════════════════════════════╗
-║   Carta Intelligence Layer v1.0.0                ║
+║   Carta Intelligence Layer v1.1.0                ║
 ║   Maritime RSS + IMO Monitor + Brief Generator   ║
+║   GraphQL (Mercurius) + REST /health             ║
 ║   Port: ${PORT}  |  Poll: 30 min  |  Brief: 06:30   ║
 ╚══════════════════════════════════════════════════╝
 `);
-console.log(`[carta] HTTP server listening on port ${PORT}`);
 
 startScheduler();
+
+await app.listen({ port: PORT, host: '0.0.0.0' });
+console.log(`[carta] Listening on port ${PORT} — GraphQL at /graphql, health at /health`);

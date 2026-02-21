@@ -33,5 +33,27 @@
     "name": "Seatrade Maritime",
     "url": "https://www.seatrade-maritime.com/rss.xml",
     "category": "news"
+  },
+  {
+    "name": "gCaptain",
+    "url": "https://gcaptain.com/feed/",
+    "category": "market",
+    "_note": "Replaces Baltic Exchange (no public RSS) — covers freight markets, BDI moves, shipping economics"
+  },
+  {
+    "name": "Ship & Bunker",
+    "url": "https://feeds.feedburner.com/shipandbunker",
+    "category": "bunker",
+    "_note": "Replaces BIMCO direct (no public RSS) — covers BIMCO clauses, fuel regulations, bunker prices"
+  },
+  {
+    "name": "World Maritime News",
+    "url": "https://worldmaritimenews.com/feed/",
+    "category": "market"
+  },
+  {
+    "name": "MarineLink",
+    "url": "https://www.marinelink.com/news/rss",
+    "category": "news"
   }
 ]

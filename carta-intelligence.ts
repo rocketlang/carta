@@ -223,7 +223,119 @@ Brief format:
 
 Priority emojis: 🔴 REGULATORY, 🟠 MARKET, 🟡 COMPETITOR, 🟢 CONTENT OPPORTUNITY
 
-If no new items, write a brief noting quiet seas and suggest a proactive content angle.`;
+If no new items, write a brief noting quiet seas and suggest a proactive content angle.
+
+━━━ HALLUCINATION GUARDRAILS (NON-NEGOTIABLE) ━━━
+
+AIS DATA REALITY — What AIS actually provides:
+✓ MMSI, vessel name, IMO number, position, SOG, COG, heading, nav status
+✓ Ship type (encoded), flag state, call sign, dimensions (sometimes)
+✓ Derived: port call patterns, route patterns from positional sequences
+✗ NEVER claim from AIS alone: CII scores, engine specs, fuel consumption,
+  cargo type/weight, owner company name, decision maker names, LinkedIn
+  profiles, email addresses, newbuild orders, fleet growth signals.
+  CII requires: engine power + DWT + fuel type + fuel consumption — NONE in AIS.
+
+CAPABILITY CLAIMS — Only claim capabilities that are live and proven today:
+✓ "Carta monitors 11 maritime RSS feeds" — TRUE, provable
+✓ "Carta reads IMO.org every 30 minutes" — TRUE, provable
+✗ NEVER claim: CII scoring from AIS alone, decision maker identification
+  from AIS, specific open rates or reply counts without real campaign data,
+  any metric you cannot source to a real dashboard or database right now.
+
+QUOTE POLICY — Zero tolerance for constructed quotes:
+✗ Never write a quote that sounds like a real customer/prospect said it
+  unless a real person actually said it, in writing, to ANKR.
+✓ If illustrative: label it explicitly as "for example, a prospect might say..."
+
+THE FIVE QUESTIONS — Every claim in every brief must pass all five:
+1. Is this number real? (From a verifiable source, not estimated)
+2. Can this capability be demonstrated right now?
+3. Is this quote from a real person who actually said it?
+4. Is this data claim within what our actual data sources provide?
+5. If a reader emails asking for proof, can we provide it within 24 hours?
+If ANY answer is NO → do not include the claim. Omit or reframe as projected/illustrative.`;
+
+// ─── Fact-Check Engine ────────────────────────────────────────────────────────
+
+const FACT_CHECK_SYSTEM_PROMPT = `You are Carta's internal fact-checker.
+Your job: apply the Five Questions protocol to any piece of draft content
+and return a structured JSON assessment. Be strict. Be honest. Be specific.
+
+The Five Questions:
+Q1. Is every number real and sourced to a verifiable origin (dashboard, database, billing record)?
+Q2. Can every capability claim be demonstrated right now, not just promised?
+Q3. Are all quotes from real people who actually said them (not constructed for illustration)?
+Q4. Are all data claims within what the actual data sources provide (AIS reality check)?
+Q5. If a reader emails asking for proof of any claim, can we provide it within 24 hours?
+
+AIS reality: AIS does NOT provide CII scores, fuel consumption, cargo data, owner names,
+decision maker contact details, or fleet growth signals. Any content claiming otherwise fails Q4.
+
+Return ONLY valid JSON in this exact shape:
+{
+  "passed": boolean,
+  "score": number (0-5, questions passed),
+  "verdict": "PASS" | "FAIL" | "CONDITIONAL",
+  "questions": [
+    { "q": "Q1", "question": "Is every number real and sourced?", "passed": boolean, "note": "..." },
+    { "q": "Q2", "question": "Can every capability claim be demonstrated now?", "passed": boolean, "note": "..." },
+    { "q": "Q3", "question": "Are all quotes from real people?", "passed": boolean, "note": "..." },
+    { "q": "Q4", "question": "Are all data claims within actual source capabilities?", "passed": boolean, "note": "..." },
+    { "q": "Q5", "question": "Can proof be provided within 24 hours if asked?", "passed": boolean, "note": "..." }
+  ],
+  "issues": ["specific issue 1", "specific issue 2"],
+  "recommendations": ["how to fix issue 1", "how to fix issue 2"]
+}`;
+
+interface FactCheckQuestion {
+  q: string;
+  question: string;
+  passed: boolean;
+  note: string;
+}
+
+interface FactCheckResult {
+  passed: boolean;
+  score: number;
+  verdict: string;
+  questions: FactCheckQuestion[];
+  issues: string[];
+  recommendations: string[];
+}
+
+async function factCheckContent(content: string): Promise<FactCheckResult> {
+  try {
+    const res = await fetch(`${AI_PROXY_URL}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: 'claude-sonnet-4-6',
+        messages: [
+          { role: 'system', content: FACT_CHECK_SYSTEM_PROMPT },
+          { role: 'user', content: `Fact-check this content:\n\n${content}` },
+        ],
+        max_tokens: 1500,
+      }),
+    });
+    if (!res.ok) throw new Error(`ai-proxy ${res.status}`);
+    const data = (await res.json()) as { choices: Array<{ message: { content: string } }> };
+    const raw = data.choices[0]?.message?.content ?? '{}';
+    // Strip markdown code fences if present
+    const json = raw.replace(/^```(?:json)?\n?/m, '').replace(/\n?```$/m, '').trim();
+    return JSON.parse(json) as FactCheckResult;
+  } catch (err) {
+    console.error(`[carta] Fact-check failed: ${err instanceof Error ? err.message : err}`);
+    return {
+      passed: false,
+      score: 0,
+      verdict: 'ERROR',
+      questions: [],
+      issues: ['Fact-check engine unavailable — treat as unverified'],
+      recommendations: ['Retry when ai-proxy is healthy'],
+    };
+  }
+}
 
 async function generateBrief(items: IntelItem[], date: string): Promise<string> {
   const hasAlert = items.some(i => i.isAlert);
@@ -445,6 +557,22 @@ const schema = `
     message: String!
   }
 
+  type FactCheckQuestion {
+    q: String!
+    question: String!
+    passed: Boolean!
+    note: String!
+  }
+
+  type FactCheckResult {
+    passed: Boolean!
+    score: Int!
+    verdict: String!
+    questions: [FactCheckQuestion!]!
+    issues: [String!]!
+    recommendations: [String!]!
+  }
+
   type Query {
     health: HealthStatus!
     latestBrief: Brief
@@ -453,6 +581,7 @@ const schema = `
 
   type Mutation {
     generateBrief: GenerateResult!
+    factCheck(content: String!): FactCheckResult!
   }
 `;
 
@@ -481,6 +610,11 @@ const resolvers = {
       lastBriefGenerated = null;   // reset guard so it runs even if already generated today
       generateDailyBrief().catch(console.error);
       return { status: 'generating', message: 'Brief generation triggered — query latestBrief in ~30s' };
+    },
+
+    factCheck: async (_: unknown, { content }: { content: string }) => {
+      console.log(`[carta] Fact-check requested (${content.length} chars)`);
+      return factCheckContent(content);
     },
   },
 };

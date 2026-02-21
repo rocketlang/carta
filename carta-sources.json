@@ -1,0 +1,37 @@
+[
+  {
+    "name": "Splash247",
+    "url": "https://splash247.com/feed/",
+    "category": "news"
+  },
+  {
+    "name": "Hellenic Shipping News",
+    "url": "https://www.hellenicshippingnews.com/feed/",
+    "category": "news"
+  },
+  {
+    "name": "The Loadstar",
+    "url": "https://theloadstar.com/feed/",
+    "category": "logistics"
+  },
+  {
+    "name": "MarineLog",
+    "url": "https://www.marinelog.com/feed/",
+    "category": "news"
+  },
+  {
+    "name": "Maritime Executive",
+    "url": "https://maritime-executive.com/rss/articles",
+    "category": "news"
+  },
+  {
+    "name": "Port Technology",
+    "url": "https://www.porttechnology.org/feed/",
+    "category": "tech"
+  },
+  {
+    "name": "Seatrade Maritime",
+    "url": "https://www.seatrade-maritime.com/rss.xml",
+    "category": "news"
+  }
+]
